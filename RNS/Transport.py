@@ -64,8 +64,8 @@ class Transport:
     LOCAL_REBROADCASTS_MAX = 2          # How many local rebroadcasts of an announce is allowed
 
     PATH_REQUEST_TIMEOUT = 15           # Default timuout for client path requests in seconds
-    PATH_REQUEST_GRACE   = 0.35         # Grace time before a path announcement is made, allows directly reachable peers to respond first
-    PATH_REQUEST_RW      = 2            # Path request random window
+    PATH_REQUEST_GRACE   = 0.4          # Grace time before a path announcement is made, allows directly reachable peers to respond first
+    PATH_REQUEST_RG      = 0.6          # Extra grace time for roaming-mode interfaces to allow more suitable peers to respond first
     PATH_REQUEST_MI      = 20           # Minimum interval in seconds for automated path requests
 
     STATE_UNKNOWN        = 0x00
@@ -746,7 +746,8 @@ class Transport:
                 packet.receipt = RNS.PacketReceipt(packet)
                 Transport.receipts.append(packet.receipt)
             
-            Transport.cache(packet)
+            # TODO: Enable when caching has been redesigned
+            # Transport.cache(packet)
 
         # Check if we have a known path for the destination in the path table
         if packet.packet_type != RNS.Packet.ANNOUNCE and packet.destination.type != RNS.Destination.PLAIN and packet.destination.type != RNS.Destination.GROUP and packet.destination_hash in Transport.destination_table:
@@ -972,6 +973,13 @@ class Transport:
         # TODO: Think long and hard about this.
         # Is it even strictly necessary with the current
         # transport rules?
+
+        # Filter packets intended for other transport instances
+        if packet.transport_id != None and packet.packet_type != RNS.Packet.ANNOUNCE:
+            if packet.transport_id != Transport.identity.hash:
+                RNS.log("Ignored packet "+RNS.prettyhexrep(packet.packet_hash)+" in transport for other transport instance", RNS.LOG_EXTREME)
+                return False
+
         if packet.context == RNS.Packet.KEEPALIVE:
             return True
         if packet.context == RNS.Packet.RESOURCE_REQ:
@@ -1136,10 +1144,31 @@ class Transport:
         elif Transport.interface_to_shared_instance(interface):
             packet.hops -= 1
 
-
         if Transport.packet_filter(packet):
-            Transport.packet_hashlist.append(packet.packet_hash)
-            Transport.cache(packet)
+            # By default, remember packet hashes to avoid routing
+            # loops in the network, using the packet filter.
+            remember_packet_hash = True
+
+            # If this packet belongs to a link in our link table,
+            # we'll have to defer adding it to the filter list.
+            # In some cases, we might see a packet over a shared-
+            # medium interface, belonging to a link that transports
+            # or terminates with this instance, but before it would
+            # normally reach us. If the packet is appended to the
+            # filter list at this point, link transport will break.
+            if packet.destination_hash in Transport.link_table:
+                remember_packet_hash = False
+
+            # If this is a link request proof, don't add it until
+            # we are sure it's not actually somewhere else in the
+            # routing chain.
+            if packet.packet_type == RNS.Packet.PROOF and packet.context == RNS.Packet.LRPROOF:
+                remember_packet_hash = False
+
+            if remember_packet_hash:
+                Transport.packet_hashlist.append(packet.packet_hash)
+                # TODO: Enable when caching has been redesigned
+                # Transport.cache(packet)
             
             # Check special conditions for local clients connected
             # through a shared Reticulum instance
@@ -1260,7 +1289,7 @@ class Transport:
                         link_entry = Transport.link_table[packet.destination_hash]
                         # If receiving and outbound interface is
                         # the same for this link, direction doesn't
-                        # matter, and we simply send the packet on.
+                        # matter, and we simply repeat the packet.
                         outbound_interface = None
                         if link_entry[2] == link_entry[4]:
                             # But check that taken hops matches one
@@ -1281,6 +1310,11 @@ class Transport:
                                     outbound_interface = link_entry[2]
 
                         if outbound_interface != None:
+                            # Add this packet to the filter hashlist if we
+                            # have determined that it's actually our turn
+                            # to process it.
+                            Transport.packet_hashlist.append(packet.packet_hash)
+
                             new_raw = packet.raw[0:1]
                             new_raw += struct.pack("!B", packet.hops)
                             new_raw += packet.raw[2:]
@@ -1712,7 +1746,24 @@ class Transport:
                         # pending link
                         for link in Transport.pending_links:
                             if link.link_id == packet.destination_hash:
-                                link.validate_proof(packet)
+                                # We need to also allow an expected hops value of
+                                # PATHFINDER_M, since in some cases, the number of hops
+                                # to the destination will be unknown at link creation
+                                # time. The real chance of this occuring is likely to be
+                                # extremely small, and this allowance could probably
+                                # be discarded without major issues, but it is kept
+                                # for now to ensure backwards compatibility.
+
+                                # TODO: Probably reset check back to
+                                # if packet.hops == link.expected_hops:
+                                # within one of the next releases
+
+                                if packet.hops == link.expected_hops or link.expected_hops == RNS.Transport.PATHFINDER_M:
+                                    # Add this packet to the filter hashlist if we
+                                    # have determined that it's actually destined
+                                    # for this system, and then validate the proof
+                                    Transport.packet_hashlist.append(packet.packet_hash)
+                                    link.validate_proof(packet)
 
                 elif packet.context == RNS.Packet.RESOURCE_PRF:
                     for link in Transport.active_links:
@@ -1729,7 +1780,7 @@ class Transport:
                     else:
                         proof_hash = None
 
-                    # Check if this proof neds to be transported
+                    # Check if this proof needs to be transported
                     if (RNS.Reticulum.transport_enabled() or from_local_client or proof_for_local_client) and packet.destination_hash in Transport.reverse_table:
                         reverse_entry = Transport.reverse_table.pop(packet.destination_hash)
                         if packet.receiving_interface == reverse_entry[1]:
@@ -2124,6 +2175,7 @@ class Transport:
         else:
             return False
 
+    @staticmethod
     def path_is_unresponsive(destination_hash):
         if destination_hash in Transport.path_states:
             if Transport.path_states[destination_hash] == Transport.STATE_UNRESPONSIVE:
@@ -2288,8 +2340,18 @@ class Transport:
                     if is_from_local_client:
                         retransmit_timeout = now
                     else:
-                        # TODO: Look at this timing
-                        retransmit_timeout = now + Transport.PATH_REQUEST_GRACE # + (RNS.rand() * Transport.PATHFINDER_RW)
+                        if Transport.is_local_client_interface(Transport.next_hop_interface(destination_hash)):
+                            RNS.log("Path request destination "+RNS.prettyhexrep(destination_hash)+" is on a local client interface, rebroadcasting immediately", RNS.LOG_EXTREME)
+                            retransmit_timeout = now
+
+                        else:
+                            retransmit_timeout = now + Transport.PATH_REQUEST_GRACE
+
+                            # If we are answering on a roaming-mode interface, wait a
+                            # little longer, to allow potential more well-connected
+                            # peers to answer first.
+                            if attached_interface.mode == RNS.Interfaces.Interface.Interface.MODE_ROAMING:
+                                retransmit_timeout += Transport.PATH_REQUEST_RG
 
                     # This handles an edge case where a peer sends a past
                     # request for a destination just after an announce for
